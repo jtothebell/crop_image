@@ -8,7 +8,20 @@ import 'crop_rotation.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
+/// How the user adjusts the crop region in [CropImage].
+enum CropInteractionMode {
+  /// Drag corner handles and the interior to resize and move the crop rect.
+  handles,
+
+  /// Pinch to zoom and pan. Only the crop area shows image pixels; the rest is
+  /// covered by [CropImage.scrimColor].
+  panZoom,
+}
+
 /// Widget to crop images.
+///
+/// Use [interactionMode] to choose either draggable corner handles ([CropInteractionMode.handles],
+/// default) or a fixed viewport with pinch-zoom and pan ([CropInteractionMode.panZoom]).
 ///
 /// See also:
 ///
@@ -110,7 +123,19 @@ class CropImage extends StatefulWidget {
 
   /// When `true`, moves when panning beyond corners, even beyond the crop rect.
   /// When `false`, moves when panning beyond corners but inside the crop rect.
+  ///
+  /// Ignored when [interactionMode] is [CropInteractionMode.panZoom].
   final bool alwaysMove;
+
+  /// Whether to use corner handles or pan/pinch gestures.
+  ///
+  /// Defaults to [CropInteractionMode.handles].
+  final CropInteractionMode interactionMode;
+
+  /// Draw a thin border around the visible crop viewport in [CropInteractionMode.panZoom].
+  ///
+  /// Defaults to true.
+  final bool showPanZoomViewportBorder;
 
   /// An optional painter between the image and the crop grid.
   ///
@@ -146,6 +171,8 @@ class CropImage extends StatefulWidget {
     this.minimumImageSize = 100,
     this.maximumImageSize = double.infinity,
     this.alwaysMove = false,
+    this.interactionMode = CropInteractionMode.handles,
+    this.showPanZoomViewportBorder = true,
     this.overlayPainter,
     this.overlayWidget,
     this.loadingPlaceholder = const CircularProgressIndicator.adaptive(),
@@ -184,6 +211,8 @@ class CropImage extends StatefulWidget {
     properties.add(DiagnosticsProperty<double>('minimumImageSize', minimumImageSize));
     properties.add(DiagnosticsProperty<double>('maximumImageSize', maximumImageSize));
     properties.add(DiagnosticsProperty<bool>('alwaysMove', alwaysMove));
+    properties.add(EnumProperty<CropInteractionMode>('interactionMode', interactionMode));
+    properties.add(DiagnosticsProperty<bool>('showPanZoomViewportBorder', showPanZoomViewportBorder));
   }
 }
 
@@ -196,6 +225,11 @@ class _CropImageState extends State<CropImage> {
   var currentCrop = Rect.zero;
   var size = Size.zero;
   _TouchPoint? panStart;
+
+  /// Viewport size in [CropInteractionMode.panZoom] (updated each build).
+  Size _viewportSize = Size.zero;
+
+  double _panZoomLastScale = 1.0;
 
   Map<_CornerTypes, Offset> get gridCorners => <_CornerTypes, Offset>{
         _CornerTypes.UpperLeft: controller.crop.topLeft.scale(size.width, size.height).translate(widget.paddingSize - widget.cornerOffset, widget.paddingSize - widget.cornerOffset),
@@ -274,12 +308,14 @@ class _CropImageState extends State<CropImage> {
             if (controller.getImage() == null) {
               return widget.loadingPlaceholder;
             }
-            // we remove the borders
             final double maxWidth = constraints.maxWidth - 2 * widget.paddingSize;
             final double maxHeight = constraints.maxHeight - 2 * widget.paddingSize;
             final double width = _getWidth(maxWidth, maxHeight);
             final double height = _getHeight(maxWidth, maxHeight);
             size = Size(width, height);
+            if (widget.interactionMode == CropInteractionMode.panZoom) {
+              return _buildPanZoom(maxWidth, maxHeight, width, height);
+            }
             final bool showCorners = widget.showCorners && widget.minimumImageSize != widget.maximumImageSize;
             return Stack(
               alignment: Alignment.center,
@@ -338,6 +374,185 @@ class _CropImageState extends State<CropImage> {
           },
         ),
       );
+
+  Widget _buildPanZoom(double maxWidth, double maxHeight, double fittedW, double fittedH) {
+    late final double vpW;
+    late final double vpH;
+    if (controller.aspectRatio != null) {
+      final double ar = controller.aspectRatio!;
+      var w = maxWidth;
+      var h = w / ar;
+      if (h > maxHeight) {
+        h = maxHeight;
+        w = h * ar;
+      }
+      vpW = w;
+      vpH = h;
+    } else {
+      vpW = maxWidth;
+      vpH = maxHeight;
+    }
+    _viewportSize = Size(vpW, vpH);
+    final fitted = Size(fittedW, fittedH);
+    final crop = controller.crop;
+
+    return SizedBox(
+      width: vpW + 2 * widget.paddingSize,
+      height: vpH + 2 * widget.paddingSize,
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: <Widget>[
+          CustomPaint(
+            size: Size(vpW + 2 * widget.paddingSize, vpH + 2 * widget.paddingSize),
+            painter: _PanZoomScrimPainter(
+              padding: widget.paddingSize,
+              viewportSize: Size(vpW, vpH),
+              scrimColor: widget.scrimColor,
+            ),
+          ),
+          Positioned(
+            left: widget.paddingSize,
+            top: widget.paddingSize,
+            width: vpW,
+            height: vpH,
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onScaleStart: _onPanZoomScaleStart,
+              onScaleUpdate: (details) => _onPanZoomScaleUpdate(details, fitted),
+              onScaleEnd: _onPanZoomScaleEnd,
+              child: Stack(
+                fit: StackFit.expand,
+                children: <Widget>[
+                  CustomPaint(
+                    painter: _PanZoomImagePainter(
+                      image: controller.getImage()!,
+                      rotation: controller.rotation,
+                      crop: crop,
+                      fittedSize: fitted,
+                    ),
+                  ),
+                  if (widget.overlayPainter != null)
+                    CustomPaint(painter: widget.overlayPainter),
+                  if (widget.overlayWidget != null) widget.overlayWidget!,
+                  if (widget.showPanZoomViewportBorder || widget.alwaysShowThirdLines)
+                    CustomPaint(
+                      painter: _PanZoomViewportOverlayPainter(
+                        showBorder: widget.showPanZoomViewportBorder,
+                        borderColor: widget.gridColor,
+                        thinWidth: widget.gridThinWidth,
+                        showThirds: widget.alwaysShowThirdLines,
+                        innerColor: widget.gridInnerColor,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _onPanZoomScaleStart(ScaleStartDetails details) {
+    _panZoomLastScale = 1.0;
+  }
+
+  void _onPanZoomScaleEnd(ScaleEndDetails details) {
+    _panZoomLastScale = 1.0;
+  }
+
+  void _onPanZoomScaleUpdate(ScaleUpdateDetails details, Size fitted) {
+    if (_viewportSize.isEmpty) {
+      return;
+    }
+    final scaleDelta = details.scale / _panZoomLastScale;
+    _panZoomLastScale = details.scale;
+
+    var next = controller.crop;
+    if ((scaleDelta - 1.0).abs() > 1e-6) {
+      next = _panZoomApplyScale(next, scaleDelta, details.localFocalPoint, fitted);
+    }
+    if (details.focalPointDelta != Offset.zero) {
+      next = _panZoomApplyPan(next, details.focalPointDelta, fitted);
+    }
+    next = _clampPanZoomCrop(next, fitted);
+    controller.crop = next;
+    widget.onCrop?.call(controller.crop);
+  }
+
+  Rect _panZoomApplyScale(Rect c, double scaleDelta, Offset focalLocal, Size fitted) {
+    final vp = _viewportSize;
+    final relX = (focalLocal.dx / vp.width).clamp(0.0, 1.0);
+    final relY = (focalLocal.dy / vp.height).clamp(0.0, 1.0);
+    final ax = c.left + relX * c.width;
+    final ay = c.top + relY * c.height;
+    var w = c.width / scaleDelta;
+    var h = c.height / scaleDelta;
+    if (controller.aspectRatio != null) {
+      final double ar = controller.aspectRatio!;
+      h = w * fitted.width / (ar * fitted.height);
+    }
+    var left = ax - relX * w;
+    var top = ay - relY * h;
+    return Rect.fromLTWH(left, top, w, h);
+  }
+
+  Rect _panZoomApplyPan(Rect c, Offset delta, Size fitted) {
+    final vp = _viewportSize;
+    final dLeft = -delta.dx / vp.width * c.width;
+    final dTop = -delta.dy / vp.height * c.height;
+    return c.shift(Offset(dLeft, dTop));
+  }
+
+  Rect _clampPanZoomCrop(Rect c, Size fitted) {
+    var w = c.width;
+    var h = c.height;
+    final minW = (widget.minimumImageSize / fitted.width).clamp(0.0, 1.0);
+    final minH = (widget.minimumImageSize / fitted.height).clamp(0.0, 1.0);
+    final maxW = widget.maximumImageSize.isFinite
+        ? (widget.maximumImageSize / fitted.width).clamp(minW, 1.0)
+        : 1.0;
+    final maxH = widget.maximumImageSize.isFinite
+        ? (widget.maximumImageSize / fitted.height).clamp(minH, 1.0)
+        : 1.0;
+
+    if (controller.aspectRatio != null) {
+      final double ar = controller.aspectRatio!;
+      w = w.clamp(minW, maxW);
+      h = w * fitted.width / (ar * fitted.height);
+      h = h.clamp(minH, maxH);
+      w = h * ar * fitted.height / fitted.width;
+      w = w.clamp(minW, maxW);
+      h = w * fitted.width / (ar * fitted.height);
+    } else {
+      w = w.clamp(minW, maxW);
+      h = h.clamp(minH, maxH);
+    }
+
+    var left = c.left;
+    var top = c.top;
+    final right = left + w;
+    final bottom = top + h;
+    if (right > 1.0) {
+      left -= right - 1.0;
+    }
+    if (bottom > 1.0) {
+      top -= bottom - 1.0;
+    }
+    if (left < 0) {
+      left = 0;
+    }
+    if (top < 0) {
+      top = 0;
+    }
+    if (left + w > 1.0) {
+      left = 1.0 - w;
+    }
+    if (top + h > 1.0) {
+      top = 1.0 - h;
+    }
+    return Rect.fromLTWH(left, top, w, h);
+  }
 
   void onPanStart(DragStartDetails details) {
     if (panStart == null) {
@@ -509,6 +724,185 @@ class _TouchPoint {
   _TouchPoint(this.type, this.offset);
 }
 
+void _paintRotatedImageIntoRect(
+  Canvas canvas,
+  ui.Image image,
+  CropRotation rotation,
+  Size size,
+  Paint paint,
+) {
+  double targetWidth = size.width;
+  double targetHeight = size.height;
+  double offset = 0;
+  if (rotation != CropRotation.up) {
+    if (rotation.isSideways) {
+      final double tmp = targetHeight;
+      targetHeight = targetWidth;
+      targetWidth = tmp;
+      offset = (targetWidth - targetHeight) / 2;
+      if (rotation == CropRotation.left) {
+        offset = -offset;
+      }
+    }
+    canvas.save();
+    canvas.translate(targetWidth / 2, targetHeight / 2);
+    canvas.rotate(rotation.radians);
+    canvas.translate(-targetWidth / 2, -targetHeight / 2);
+  }
+  paint.filterQuality = FilterQuality.high;
+  canvas.drawImageRect(
+    image,
+    Rect.fromLTWH(0, 0, image.width.toDouble(), image.height.toDouble()),
+    Rect.fromLTWH(offset, offset, targetWidth, targetHeight),
+    paint,
+  );
+  if (rotation != CropRotation.up) {
+    canvas.restore();
+  }
+}
+
+/// Scrim with a transparent viewport hole (same geometry as [CropGrid]).
+class _PanZoomScrimPainter extends CustomPainter {
+  _PanZoomScrimPainter({
+    required this.padding,
+    required this.viewportSize,
+    required this.scrimColor,
+  });
+
+  final double padding;
+  final Size viewportSize;
+  final Color scrimColor;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final Rect full = Offset(padding, padding) & Size(size.width - 2 * padding, size.height - 2 * padding);
+    final Rect hole = Offset(padding, padding) & viewportSize;
+    canvas.save();
+    canvas.clipRect(hole, clipOp: ui.ClipOp.difference);
+    canvas.drawRect(full, Paint()..color = scrimColor);
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(_PanZoomScrimPainter oldDelegate) =>
+      oldDelegate.padding != padding ||
+      oldDelegate.viewportSize != viewportSize ||
+      oldDelegate.scrimColor != scrimColor;
+}
+
+/// Draws the portion of the fitted image described by [crop], scaled to cover the viewport.
+class _PanZoomImagePainter extends CustomPainter {
+  _PanZoomImagePainter({
+    required this.image,
+    required this.rotation,
+    required this.crop,
+    required this.fittedSize,
+  });
+
+  final ui.Image image;
+  final CropRotation rotation;
+  final Rect crop;
+  final Size fittedSize;
+
+  final Paint _paint = Paint();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final pixelCrop = crop.multiply(fittedSize);
+    final double pw = pixelCrop.width;
+    final double ph = pixelCrop.height;
+    if (pw <= 0 || ph <= 0) {
+      return;
+    }
+    final double s = math.max(size.width / pw, size.height / ph);
+    canvas.save();
+    canvas.clipRect(Offset.zero & size);
+    canvas.translate(-pixelCrop.left * s, -pixelCrop.top * s);
+    canvas.scale(s);
+    _paintRotatedImageIntoRect(canvas, image, rotation, fittedSize, _paint);
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(_PanZoomImagePainter oldDelegate) =>
+      oldDelegate.image != image ||
+      oldDelegate.rotation != rotation ||
+      oldDelegate.crop != crop ||
+      oldDelegate.fittedSize != fittedSize;
+}
+
+/// Rule-of-thirds and/or border on the pan-zoom viewport.
+class _PanZoomViewportOverlayPainter extends CustomPainter {
+  _PanZoomViewportOverlayPainter({
+    required this.showBorder,
+    required this.borderColor,
+    required this.thinWidth,
+    required this.showThirds,
+    required this.innerColor,
+  });
+
+  final bool showBorder;
+  final Color borderColor;
+  final double thinWidth;
+  final bool showThirds;
+  final Color innerColor;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final Rect bounds = Offset.zero & size;
+    if (showBorder) {
+      canvas.drawRect(
+        bounds,
+        Paint()
+          ..color = borderColor
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = thinWidth
+          ..isAntiAlias = true,
+      );
+    }
+    if (showThirds) {
+      final thirdHeight = bounds.height / 3.0;
+      final thirdWidth = bounds.width / 3.0;
+      final double o = thinWidth / 2;
+      final path = Path()
+        ..addPolygon([
+          bounds.topLeft.translate(o, thirdHeight),
+          bounds.topRight.translate(-o, thirdHeight),
+        ], false)
+        ..addPolygon([
+          bounds.bottomLeft.translate(o, -thirdHeight),
+          bounds.bottomRight.translate(-o, -thirdHeight),
+        ], false)
+        ..addPolygon([
+          bounds.topLeft.translate(thirdWidth, o),
+          bounds.bottomLeft.translate(thirdWidth, -o),
+        ], false)
+        ..addPolygon([
+          bounds.topRight.translate(-thirdWidth, o),
+          bounds.bottomRight.translate(-thirdWidth, -o),
+        ], false);
+      canvas.drawPath(
+        path,
+        Paint()
+          ..color = innerColor
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = thinWidth
+          ..strokeCap = StrokeCap.butt
+          ..strokeJoin = StrokeJoin.round
+          ..isAntiAlias = true,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(_PanZoomViewportOverlayPainter oldDelegate) =>
+      oldDelegate.showBorder != showBorder ||
+      oldDelegate.borderColor != borderColor ||
+      oldDelegate.thinWidth != thinWidth ||
+      oldDelegate.showThirds != showThirds ||
+      oldDelegate.innerColor != innerColor;
+}
+
 // FIXME: shouldn't be repainted each time the grid moves, should it?
 class _RotatedImagePainter extends CustomPainter {
   _RotatedImagePainter(this.image, this.rotation);
@@ -520,34 +914,7 @@ class _RotatedImagePainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    double targetWidth = size.width;
-    double targetHeight = size.height;
-    double offset = 0;
-    if (rotation != CropRotation.up) {
-      if (rotation.isSideways) {
-        final double tmp = targetHeight;
-        targetHeight = targetWidth;
-        targetWidth = tmp;
-        offset = (targetWidth - targetHeight) / 2;
-        if (rotation == CropRotation.left) {
-          offset = -offset;
-        }
-      }
-      canvas.save();
-      canvas.translate(targetWidth / 2, targetHeight / 2);
-      canvas.rotate(rotation.radians);
-      canvas.translate(-targetWidth / 2, -targetHeight / 2);
-    }
-    _paint.filterQuality = FilterQuality.high;
-    canvas.drawImageRect(
-      image,
-      Rect.fromLTWH(0, 0, image.width.toDouble(), image.height.toDouble()),
-      Rect.fromLTWH(offset, offset, targetWidth, targetHeight),
-      _paint,
-    );
-    if (rotation != CropRotation.up) {
-      canvas.restore();
-    }
+    _paintRotatedImageIntoRect(canvas, image, rotation, size, _paint);
   }
 
   @override

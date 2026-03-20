@@ -43,6 +43,7 @@ class _MyHomePageState extends State<MyHomePage> {
             paddingSize: 25.0,
             alwaysMove: true,
             maximumImageSize: 500,
+            interactionMode: CropInteractionMode.panZoom,
           ),
         ),
         bottomNavigationBar: _buildButtons(),
