@@ -137,6 +137,12 @@ class CropImage extends StatefulWidget {
   /// Defaults to true.
   final bool showPanZoomViewportBorder;
 
+  /// Fill color behind the image inside the pan-zoom viewport when overscrolled zoom-out
+  /// ([CropInteractionMode.panZoom]) makes the image smaller than the viewport.
+  ///
+  /// Defaults to a light grey (`0xFFE8E8E8`).
+  final Color panZoomLetterboxColor;
+
   /// An optional painter between the image and the crop grid.
   ///
   /// Could be used for special effects on the cropped area.
@@ -173,6 +179,7 @@ class CropImage extends StatefulWidget {
     this.alwaysMove = false,
     this.interactionMode = CropInteractionMode.handles,
     this.showPanZoomViewportBorder = true,
+    this.panZoomLetterboxColor = const Color(0xFFE8E8E8),
     this.overlayPainter,
     this.overlayWidget,
     this.loadingPlaceholder = const CircularProgressIndicator.adaptive(),
@@ -185,9 +192,6 @@ class CropImage extends StatefulWidget {
         assert(minimumImageSize > 0, 'minimumImageSize cannot be zero'),
         assert(maximumImageSize >= minimumImageSize, 'maximumImageSize cannot be less than minimumImageSize'),
         assert(cornerOffset >= 0, 'cornerOffset cannot be negative');
-
-  @override
-  State<CropImage> createState() => _CropImageState();
 
   @override
   void debugFillProperties(DiagnosticPropertiesBuilder properties) {
@@ -213,12 +217,18 @@ class CropImage extends StatefulWidget {
     properties.add(DiagnosticsProperty<bool>('alwaysMove', alwaysMove));
     properties.add(EnumProperty<CropInteractionMode>('interactionMode', interactionMode));
     properties.add(DiagnosticsProperty<bool>('showPanZoomViewportBorder', showPanZoomViewportBorder));
+    properties.add(DiagnosticsProperty<Color>('panZoomLetterboxColor', panZoomLetterboxColor));
   }
+
+  @override
+  State<CropImage> createState() => _CropImageState();
 }
+
+const double _kMinPanZoomVisualScale = 0.22;
 
 enum _CornerTypes { UpperLeft, UpperRight, LowerRight, LowerLeft, None, Move }
 
-class _CropImageState extends State<CropImage> {
+class _CropImageState extends State<CropImage> with SingleTickerProviderStateMixin {
   late CropController controller;
   late ImageStream _stream;
   late ImageStreamListener _streamListener;
@@ -231,6 +241,13 @@ class _CropImageState extends State<CropImage> {
 
   double _panZoomLastScale = 1.0;
 
+  /// Multiplies the pan-zoom cover scale; &lt; 1 letterboxes the image inside the viewport.
+  double _panZoomVisualScale = 1.0;
+
+  double _panZoomSnapFrom = 1.0;
+
+  late final AnimationController _panZoomSnapController;
+
   Map<_CornerTypes, Offset> get gridCorners => <_CornerTypes, Offset>{
         _CornerTypes.UpperLeft: controller.crop.topLeft.scale(size.width, size.height).translate(widget.paddingSize - widget.cornerOffset, widget.paddingSize - widget.cornerOffset),
         _CornerTypes.UpperRight: controller.crop.topRight.scale(size.width, size.height).translate(widget.paddingSize + widget.cornerOffset, widget.paddingSize - widget.cornerOffset),
@@ -241,6 +258,9 @@ class _CropImageState extends State<CropImage> {
   @override
   void initState() {
     super.initState();
+
+    _panZoomSnapController = AnimationController(vsync: this, duration: const Duration(milliseconds: 280));
+    _panZoomSnapController.addListener(_onPanZoomSnapTick);
 
     controller = widget.controller ?? CropController();
     controller.addListener(onChange);
@@ -261,12 +281,30 @@ class _CropImageState extends State<CropImage> {
 
     _stream.removeListener(_streamListener);
 
+    _panZoomSnapController.dispose();
+
     super.dispose();
+  }
+
+  void _onPanZoomSnapTick() {
+    if (!mounted) {
+      return;
+    }
+    final double t = Curves.easeOutCubic.transform(_panZoomSnapController.value);
+    setState(() {
+      _panZoomVisualScale = ui.lerpDouble(_panZoomSnapFrom, 1.0, t)!;
+    });
   }
 
   @override
   void didUpdateWidget(CropImage oldWidget) {
     super.didUpdateWidget(oldWidget);
+
+    if (oldWidget.interactionMode == CropInteractionMode.panZoom &&
+        widget.interactionMode != CropInteractionMode.panZoom) {
+      _panZoomSnapController.stop();
+      _panZoomVisualScale = 1.0;
+    }
 
     if (widget.controller == null && oldWidget.controller != null) {
       controller = CropController.fromValue(oldWidget.controller!.value);
@@ -423,12 +461,14 @@ class _CropImageState extends State<CropImage> {
               child: Stack(
                 fit: StackFit.expand,
                 children: <Widget>[
+                  ColoredBox(color: widget.panZoomLetterboxColor),
                   CustomPaint(
                     painter: _PanZoomImagePainter(
                       image: controller.getImage()!,
                       rotation: controller.rotation,
                       crop: crop,
                       fittedSize: fitted,
+                      visualScale: _panZoomVisualScale,
                     ),
                   ),
                   if (widget.overlayPainter != null)
@@ -455,10 +495,18 @@ class _CropImageState extends State<CropImage> {
 
   void _onPanZoomScaleStart(ScaleStartDetails details) {
     _panZoomLastScale = 1.0;
+    if (_panZoomSnapController.isAnimating) {
+      _panZoomSnapController.stop();
+    }
   }
 
   void _onPanZoomScaleEnd(ScaleEndDetails details) {
     _panZoomLastScale = 1.0;
+    if (_panZoomVisualScale >= 1.0 - 1e-6) {
+      return;
+    }
+    _panZoomSnapFrom = _panZoomVisualScale;
+    _panZoomSnapController.forward(from: 0);
   }
 
   void _onPanZoomScaleUpdate(ScaleUpdateDetails details, Size fitted) {
@@ -468,15 +516,41 @@ class _CropImageState extends State<CropImage> {
     final scaleDelta = details.scale / _panZoomLastScale;
     _panZoomLastScale = details.scale;
 
-    var next = controller.crop;
+    var cropRect = controller.crop;
+    var vs = _panZoomVisualScale;
+
+    // [_panZoomApplyScale] uses w = crop.width / scaleDelta, so:
+    // scaleDelta > 1 → smaller crop → zoom **in** on the image.
+    // scaleDelta < 1 → larger crop → zoom **out** (see more image).
     if ((scaleDelta - 1.0).abs() > 1e-6) {
-      next = _panZoomApplyScale(next, scaleDelta, details.localFocalPoint, fitted);
+      if (scaleDelta > 1.0) {
+        // Zoom in: only change crop; letterbox is cleared on [onScaleEnd] if still overscrolled.
+        final Rect n = _panZoomApplyScale(cropRect, scaleDelta, details.localFocalPoint, fitted);
+        cropRect = _clampPanZoomCrop(n, fitted);
+      } else {
+        final Rect n = _panZoomApplyScale(cropRect, scaleDelta, details.localFocalPoint, fitted);
+        final Rect cl = _clampPanZoomCrop(n, fitted);
+        final double vw = n.width > 0 ? cl.width / n.width : 1.0;
+        final double vh = n.height > 0 ? cl.height / n.height : 1.0;
+        var factor = math.min(vw, vh);
+        if (factor >= 1.0 - 1e-9 &&
+            (cl.width - cropRect.width).abs() < 1e-6 &&
+            (cl.height - cropRect.height).abs() < 1e-6) {
+          factor = scaleDelta;
+        }
+        vs = (vs * factor).clamp(_kMinPanZoomVisualScale, 1.0);
+        cropRect = cl;
+      }
     }
     if (details.focalPointDelta != Offset.zero) {
-      next = _panZoomApplyPan(next, details.focalPointDelta, fitted);
+      cropRect = _panZoomApplyPan(cropRect, details.focalPointDelta, fitted);
+      cropRect = _clampPanZoomCrop(cropRect, fitted);
     }
-    next = _clampPanZoomCrop(next, fitted);
-    controller.crop = next;
+
+    setState(() {
+      _panZoomVisualScale = vs;
+    });
+    controller.crop = cropRect;
     widget.onCrop?.call(controller.crop);
   }
 
@@ -791,18 +865,24 @@ class _PanZoomScrimPainter extends CustomPainter {
 }
 
 /// Draws the portion of the fitted image described by [crop], scaled to cover the viewport.
+///
+/// [visualScale] is applied after the cover scale; values below 1 letterbox the image inside [size].
 class _PanZoomImagePainter extends CustomPainter {
   _PanZoomImagePainter({
     required this.image,
     required this.rotation,
     required this.crop,
     required this.fittedSize,
+    required this.visualScale,
   });
 
   final ui.Image image;
   final CropRotation rotation;
   final Rect crop;
   final Size fittedSize;
+
+  /// In (0, 1]; 1 = fill viewport (cover). Smaller = overscroll zoom-out (letterboxed).
+  final double visualScale;
 
   final Paint _paint = Paint();
 
@@ -814,9 +894,16 @@ class _PanZoomImagePainter extends CustomPainter {
     if (pw <= 0 || ph <= 0) {
       return;
     }
-    final double s = math.max(size.width / pw, size.height / ph);
+    final double s0 = math.max(size.width / pw, size.height / ph);
+    final double s = s0 * visualScale.clamp(_kMinPanZoomVisualScale, 1.0);
+    final double contentW = pw * s;
+    final double contentH = ph * s;
+    final double ox = (size.width - contentW) / 2;
+    final double oy = (size.height - contentH) / 2;
+
     canvas.save();
     canvas.clipRect(Offset.zero & size);
+    canvas.translate(ox, oy);
     canvas.translate(-pixelCrop.left * s, -pixelCrop.top * s);
     canvas.scale(s);
     _paintRotatedImageIntoRect(canvas, image, rotation, fittedSize, _paint);
@@ -828,7 +915,8 @@ class _PanZoomImagePainter extends CustomPainter {
       oldDelegate.image != image ||
       oldDelegate.rotation != rotation ||
       oldDelegate.crop != crop ||
-      oldDelegate.fittedSize != fittedSize;
+      oldDelegate.fittedSize != fittedSize ||
+      oldDelegate.visualScale != visualScale;
 }
 
 /// Rule-of-thirds and/or border on the pan-zoom viewport.
