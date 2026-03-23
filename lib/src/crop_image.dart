@@ -944,7 +944,7 @@ class _PanZoomDimmedSurroundPainter extends CustomPainter {
     canvas.scale(s);
     _paint.filterQuality = FilterQuality.high;
     _paint.color = Color.fromRGBO(255, 255, 255, opacity);
-    _paint.blendMode = BlendMode.modulate;
+    _paint.blendMode = BlendMode.darken;
     _paint.isAntiAlias = true;
     _paintRotatedImageIntoRect(canvas, image, rotation, fittedSize, _paint);
     canvas.restore();
