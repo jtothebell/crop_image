@@ -1,20 +1,22 @@
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+
 import 'crop_controller.dart';
 import 'crop_grid.dart';
 import 'crop_rect.dart';
 import 'crop_rotation.dart';
-import 'package:flutter/foundation.dart';
-import 'package:flutter/material.dart';
 
 /// How the user adjusts the crop region in [CropImage].
 enum CropInteractionMode {
   /// Drag corner handles and the interior to resize and move the crop rect.
   handles,
 
-  /// Pinch to zoom and pan. Only the crop area shows image pixels; the rest is
-  /// covered by [CropImage.scrimColor].
+  /// Pinch to zoom and pan. Only the crop viewport shows the sharp image; the
+  /// surround is [CropImage.scrimColor], or a dimmed full-image preview while
+  /// the user is gesturing ([CropImage.panZoomSurroundOpacity]).
   panZoom,
 }
 
@@ -143,6 +145,12 @@ class CropImage extends StatefulWidget {
   /// Defaults to a light grey (`0xFFE8E8E8`).
   final Color panZoomLetterboxColor;
 
+  /// During a pan-zoom gesture, the scrim region outside the viewport shows a dimmed copy of
+  /// the full image for context. This sets that layer's opacity (0 = disabled, use solid [scrimColor] only).
+  ///
+  /// Defaults to `0.38`.
+  final double panZoomSurroundOpacity;
+
   /// An optional painter between the image and the crop grid.
   ///
   /// Could be used for special effects on the cropped area.
@@ -180,6 +188,7 @@ class CropImage extends StatefulWidget {
     this.interactionMode = CropInteractionMode.handles,
     this.showPanZoomViewportBorder = true,
     this.panZoomLetterboxColor = const Color(0xFFE8E8E8),
+    this.panZoomSurroundOpacity = 0.3,
     this.overlayPainter,
     this.overlayWidget,
     this.loadingPlaceholder = const CircularProgressIndicator.adaptive(),
@@ -191,7 +200,8 @@ class CropImage extends StatefulWidget {
         assert(gridThickWidth > 0, 'gridThickWidth cannot be zero'),
         assert(minimumImageSize > 0, 'minimumImageSize cannot be zero'),
         assert(maximumImageSize >= minimumImageSize, 'maximumImageSize cannot be less than minimumImageSize'),
-        assert(cornerOffset >= 0, 'cornerOffset cannot be negative');
+        assert(cornerOffset >= 0, 'cornerOffset cannot be negative'),
+        assert(panZoomSurroundOpacity >= 0 && panZoomSurroundOpacity <= 1, 'panZoomSurroundOpacity must be 0..1');
 
   @override
   void debugFillProperties(DiagnosticPropertiesBuilder properties) {
@@ -218,6 +228,7 @@ class CropImage extends StatefulWidget {
     properties.add(EnumProperty<CropInteractionMode>('interactionMode', interactionMode));
     properties.add(DiagnosticsProperty<bool>('showPanZoomViewportBorder', showPanZoomViewportBorder));
     properties.add(DiagnosticsProperty<Color>('panZoomLetterboxColor', panZoomLetterboxColor));
+    properties.add(DiagnosticsProperty<double>('panZoomSurroundOpacity', panZoomSurroundOpacity));
   }
 
   @override
@@ -247,6 +258,9 @@ class _CropImageState extends State<CropImage> with SingleTickerProviderStateMix
   double _panZoomSnapFrom = 1.0;
 
   late final AnimationController _panZoomSnapController;
+
+  /// True while a pan-zoom scale/pan gesture is in progress (surround preview).
+  bool _panZoomGestureActive = false;
 
   Map<_CornerTypes, Offset> get gridCorners => <_CornerTypes, Offset>{
         _CornerTypes.UpperLeft: controller.crop.topLeft.scale(size.width, size.height).translate(widget.paddingSize - widget.cornerOffset, widget.paddingSize - widget.cornerOffset),
@@ -300,10 +314,10 @@ class _CropImageState extends State<CropImage> with SingleTickerProviderStateMix
   void didUpdateWidget(CropImage oldWidget) {
     super.didUpdateWidget(oldWidget);
 
-    if (oldWidget.interactionMode == CropInteractionMode.panZoom &&
-        widget.interactionMode != CropInteractionMode.panZoom) {
+    if (oldWidget.interactionMode == CropInteractionMode.panZoom && widget.interactionMode != CropInteractionMode.panZoom) {
       _panZoomSnapController.stop();
       _panZoomVisualScale = 1.0;
+      _panZoomGestureActive = false;
     }
 
     if (widget.controller == null && oldWidget.controller != null) {
@@ -440,14 +454,29 @@ class _CropImageState extends State<CropImage> with SingleTickerProviderStateMix
       child: Stack(
         clipBehavior: Clip.none,
         children: <Widget>[
-          CustomPaint(
-            size: Size(vpW + 2 * widget.paddingSize, vpH + 2 * widget.paddingSize),
-            painter: _PanZoomScrimPainter(
-              padding: widget.paddingSize,
-              viewportSize: Size(vpW, vpH),
-              scrimColor: widget.scrimColor,
+          if (!_panZoomGestureActive || widget.panZoomSurroundOpacity <= 0)
+            CustomPaint(
+              size: Size(vpW + 2 * widget.paddingSize, vpH + 2 * widget.paddingSize),
+              painter: _PanZoomScrimPainter(
+                padding: widget.paddingSize,
+                viewportSize: Size(vpW, vpH),
+                scrimColor: widget.scrimColor,
+              ),
             ),
-          ),
+          if (_panZoomGestureActive && widget.panZoomSurroundOpacity > 0)
+            CustomPaint(
+              size: Size(vpW + 2 * widget.paddingSize, vpH + 2 * widget.paddingSize),
+              painter: _PanZoomDimmedSurroundPainter(
+                padding: widget.paddingSize,
+                viewportSize: Size(vpW, vpH),
+                image: controller.getImage()!,
+                rotation: controller.rotation,
+                crop: crop,
+                fittedSize: fitted,
+                visualScale: _panZoomVisualScale,
+                opacity: widget.panZoomSurroundOpacity,
+              ),
+            ),
           Positioned(
             left: widget.paddingSize,
             top: widget.paddingSize,
@@ -471,8 +500,7 @@ class _CropImageState extends State<CropImage> with SingleTickerProviderStateMix
                       visualScale: _panZoomVisualScale,
                     ),
                   ),
-                  if (widget.overlayPainter != null)
-                    CustomPaint(painter: widget.overlayPainter),
+                  if (widget.overlayPainter != null) CustomPaint(painter: widget.overlayPainter),
                   if (widget.overlayWidget != null) widget.overlayWidget!,
                   if (widget.showPanZoomViewportBorder || widget.alwaysShowThirdLines)
                     CustomPaint(
@@ -498,10 +526,16 @@ class _CropImageState extends State<CropImage> with SingleTickerProviderStateMix
     if (_panZoomSnapController.isAnimating) {
       _panZoomSnapController.stop();
     }
+    setState(() {
+      _panZoomGestureActive = true;
+    });
   }
 
   void _onPanZoomScaleEnd(ScaleEndDetails details) {
     _panZoomLastScale = 1.0;
+    setState(() {
+      _panZoomGestureActive = false;
+    });
     if (_panZoomVisualScale >= 1.0 - 1e-6) {
       return;
     }
@@ -533,9 +567,7 @@ class _CropImageState extends State<CropImage> with SingleTickerProviderStateMix
         final double vw = n.width > 0 ? cl.width / n.width : 1.0;
         final double vh = n.height > 0 ? cl.height / n.height : 1.0;
         var factor = math.min(vw, vh);
-        if (factor >= 1.0 - 1e-9 &&
-            (cl.width - cropRect.width).abs() < 1e-6 &&
-            (cl.height - cropRect.height).abs() < 1e-6) {
+        if (factor >= 1.0 - 1e-9 && (cl.width - cropRect.width).abs() < 1e-6 && (cl.height - cropRect.height).abs() < 1e-6) {
           factor = scaleDelta;
         }
         vs = (vs * factor).clamp(_kMinPanZoomVisualScale, 1.0);
@@ -583,12 +615,8 @@ class _CropImageState extends State<CropImage> with SingleTickerProviderStateMix
     var h = c.height;
     final minW = (widget.minimumImageSize / fitted.width).clamp(0.0, 1.0);
     final minH = (widget.minimumImageSize / fitted.height).clamp(0.0, 1.0);
-    final maxW = widget.maximumImageSize.isFinite
-        ? (widget.maximumImageSize / fitted.width).clamp(minW, 1.0)
-        : 1.0;
-    final maxH = widget.maximumImageSize.isFinite
-        ? (widget.maximumImageSize / fitted.height).clamp(minH, 1.0)
-        : 1.0;
+    final maxW = widget.maximumImageSize.isFinite ? (widget.maximumImageSize / fitted.width).clamp(minW, 1.0) : 1.0;
+    final maxH = widget.maximumImageSize.isFinite ? (widget.maximumImageSize / fitted.height).clamp(minH, 1.0) : 1.0;
 
     if (controller.aspectRatio != null) {
       final double ar = controller.aspectRatio!;
@@ -858,10 +886,73 @@ class _PanZoomScrimPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(_PanZoomScrimPainter oldDelegate) =>
-      oldDelegate.padding != padding ||
-      oldDelegate.viewportSize != viewportSize ||
-      oldDelegate.scrimColor != scrimColor;
+  bool shouldRepaint(_PanZoomScrimPainter oldDelegate) => oldDelegate.padding != padding || oldDelegate.viewportSize != viewportSize || oldDelegate.scrimColor != scrimColor;
+}
+
+/// Full fitted image in the scrim ring, dimmed, using the same transform as
+/// [_PanZoomImagePainter] so cropped-out regions line up with the viewport.
+class _PanZoomDimmedSurroundPainter extends CustomPainter {
+  _PanZoomDimmedSurroundPainter({
+    required this.padding,
+    required this.viewportSize,
+    required this.image,
+    required this.rotation,
+    required this.crop,
+    required this.fittedSize,
+    required this.visualScale,
+    required this.opacity,
+  });
+
+  final double padding;
+  final Size viewportSize;
+  final ui.Image image;
+  final CropRotation rotation;
+  final Rect crop;
+  final Size fittedSize;
+  final double visualScale;
+  final double opacity;
+
+  final Paint _paint = Paint();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (opacity <= 0) {
+      return;
+    }
+    final Rect hole = Offset(padding, padding) & viewportSize;
+    canvas.save();
+    canvas.clipRect(hole, clipOp: ui.ClipOp.difference);
+    canvas.translate(padding, padding);
+
+    final pixelCrop = crop.multiply(fittedSize);
+    final double pw = pixelCrop.width;
+    final double ph = pixelCrop.height;
+    if (pw <= 0 || ph <= 0) {
+      canvas.restore();
+      return;
+    }
+    final double s0 = math.max(viewportSize.width / pw, viewportSize.height / ph);
+    final double s = s0 * visualScale.clamp(_kMinPanZoomVisualScale, 1.0);
+    final double contentW = pw * s;
+    final double contentH = ph * s;
+    final double ox = (viewportSize.width - contentW) / 2;
+    final double oy = (viewportSize.height - contentH) / 2;
+
+    canvas.save();
+    canvas.translate(ox, oy);
+    canvas.translate(-pixelCrop.left * s, -pixelCrop.top * s);
+    canvas.scale(s);
+    _paint.filterQuality = FilterQuality.high;
+    _paint.color = Color.fromRGBO(255, 255, 255, opacity);
+    _paint.blendMode = BlendMode.modulate;
+    _paint.isAntiAlias = true;
+    _paintRotatedImageIntoRect(canvas, image, rotation, fittedSize, _paint);
+    canvas.restore();
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(_PanZoomDimmedSurroundPainter oldDelegate) => oldDelegate.padding != padding || oldDelegate.viewportSize != viewportSize || oldDelegate.image != image || oldDelegate.rotation != rotation || oldDelegate.crop != crop || oldDelegate.fittedSize != fittedSize || oldDelegate.visualScale != visualScale || oldDelegate.opacity != opacity;
 }
 
 /// Draws the portion of the fitted image described by [crop], scaled to cover the viewport.
@@ -911,12 +1002,7 @@ class _PanZoomImagePainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(_PanZoomImagePainter oldDelegate) =>
-      oldDelegate.image != image ||
-      oldDelegate.rotation != rotation ||
-      oldDelegate.crop != crop ||
-      oldDelegate.fittedSize != fittedSize ||
-      oldDelegate.visualScale != visualScale;
+  bool shouldRepaint(_PanZoomImagePainter oldDelegate) => oldDelegate.image != image || oldDelegate.rotation != rotation || oldDelegate.crop != crop || oldDelegate.fittedSize != fittedSize || oldDelegate.visualScale != visualScale;
 }
 
 /// Rule-of-thirds and/or border on the pan-zoom viewport.
@@ -983,12 +1069,7 @@ class _PanZoomViewportOverlayPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(_PanZoomViewportOverlayPainter oldDelegate) =>
-      oldDelegate.showBorder != showBorder ||
-      oldDelegate.borderColor != borderColor ||
-      oldDelegate.thinWidth != thinWidth ||
-      oldDelegate.showThirds != showThirds ||
-      oldDelegate.innerColor != innerColor;
+  bool shouldRepaint(_PanZoomViewportOverlayPainter oldDelegate) => oldDelegate.showBorder != showBorder || oldDelegate.borderColor != borderColor || oldDelegate.thinWidth != thinWidth || oldDelegate.showThirds != showThirds || oldDelegate.innerColor != innerColor;
 }
 
 // FIXME: shouldn't be repainted each time the grid moves, should it?
