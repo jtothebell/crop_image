@@ -840,6 +840,7 @@ void _paintRotatedImageIntoRect(
   CropRotation rotation,
   Size size,
   Paint paint,
+  Rect visibleRect,
 ) {
   double targetWidth = size.width;
   double targetHeight = size.height;
@@ -859,11 +860,37 @@ void _paintRotatedImageIntoRect(
     canvas.rotate(rotation.radians);
     canvas.translate(-targetWidth / 2, -targetHeight / 2);
   }
+
+  Rect localVisibleRect = visibleRect;
+  if (rotation != CropRotation.up) {
+    final Matrix4 matrix = Matrix4.identity()
+      ..translate(targetWidth / 2, targetHeight / 2)
+      ..rotateZ(rotation.radians)
+      ..translate(-targetWidth / 2, -targetHeight / 2);
+    final Matrix4 inverse = matrix.clone()..invert();
+    localVisibleRect = MatrixUtils.transformRect(inverse, visibleRect);
+  }
+
+  final Rect imageRect = Rect.fromLTWH(offset, offset, targetWidth, targetHeight);
+  final Rect dstRect = localVisibleRect.intersect(imageRect);
+  if (dstRect.width <= 0 || dstRect.height <= 0) {
+    if (rotation != CropRotation.up) {
+      canvas.restore();
+    }
+    return;
+  }
+
+  final double srcLeft = (dstRect.left - offset) / targetWidth * image.width;
+  final double srcTop = (dstRect.top - offset) / targetHeight * image.height;
+  final double srcWidth = dstRect.width / targetWidth * image.width;
+  final double srcHeight = dstRect.height / targetHeight * image.height;
+  final Rect srcRect = Rect.fromLTWH(srcLeft, srcTop, srcWidth, srcHeight);
+
   paint.filterQuality = FilterQuality.high;
   canvas.drawImageRect(
     image,
-    Rect.fromLTWH(0, 0, image.width.toDouble(), image.height.toDouble()),
-    Rect.fromLTWH(offset, offset, targetWidth, targetHeight),
+    srcRect,
+    dstRect,
     paint,
   );
   if (rotation != CropRotation.up) {
@@ -946,13 +973,24 @@ class _PanZoomDimmedSurroundPainter extends CustomPainter {
     final double ox = (viewportSize.width - contentW) / 2;
     final double oy = (viewportSize.height - contentH) / 2;
 
+    final double dx = ox - pixelCrop.left * s;
+    final double dy = oy - pixelCrop.top * s;
+
+    final Rect screenVisibleRect = Rect.fromLTWH(-padding, -padding, size.width, size.height);
+
+    final Rect visibleRect = Rect.fromLTRB(
+      (screenVisibleRect.left - dx) / s,
+      (screenVisibleRect.top - dy) / s,
+      (screenVisibleRect.right - dx) / s,
+      (screenVisibleRect.bottom - dy) / s,
+    );
+
     canvas.save();
-    canvas.translate(ox, oy);
-    canvas.translate(-pixelCrop.left * s, -pixelCrop.top * s);
+    canvas.translate(dx, dy);
     canvas.scale(s);
     _paint.color = Color.fromRGBO(255, 255, 255, opacity);
     _paint.blendMode = BlendMode.darken;
-    _paintRotatedImageIntoRect(canvas, image, rotation, fittedSize, _paint);
+    _paintRotatedImageIntoRect(canvas, image, rotation, fittedSize, _paint, visibleRect);
     canvas.restore();
     canvas.restore();
   }
@@ -998,12 +1036,21 @@ class _PanZoomImagePainter extends CustomPainter {
     final double ox = (size.width - contentW) / 2;
     final double oy = (size.height - contentH) / 2;
 
+    final double dx = ox - pixelCrop.left * s;
+    final double dy = oy - pixelCrop.top * s;
+
+    final Rect visibleRect = Rect.fromLTRB(
+      (0 - dx) / s,
+      (0 - dy) / s,
+      (size.width - dx) / s,
+      (size.height - dy) / s,
+    );
+
     canvas.save();
     canvas.clipRect(Offset.zero & size);
-    canvas.translate(ox, oy);
-    canvas.translate(-pixelCrop.left * s, -pixelCrop.top * s);
+    canvas.translate(dx, dy);
     canvas.scale(s);
-    _paintRotatedImageIntoRect(canvas, image, rotation, fittedSize, _paint);
+    _paintRotatedImageIntoRect(canvas, image, rotation, fittedSize, _paint, visibleRect);
     canvas.restore();
   }
 
@@ -1089,7 +1136,7 @@ class _RotatedImagePainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    _paintRotatedImageIntoRect(canvas, image, rotation, size, _paint);
+    _paintRotatedImageIntoRect(canvas, image, rotation, size, _paint, Offset.zero & size);
   }
 
   @override
