@@ -613,8 +613,16 @@ class _CropImageState extends State<CropImage> with SingleTickerProviderStateMix
   Rect _clampPanZoomCrop(Rect c, Size fitted) {
     var w = c.width;
     var h = c.height;
-    final minW = (widget.minimumImageSize / fitted.width).clamp(0.0, 1.0);
-    final minH = (widget.minimumImageSize / fitted.height).clamp(0.0, 1.0);
+    var minW = (widget.minimumImageSize / fitted.width).clamp(0.0, 1.0);
+    var minH = (widget.minimumImageSize / fitted.height).clamp(0.0, 1.0);
+    if (controller.aspectRatio != null) {
+      final double ar = controller.aspectRatio!;
+      if (ar < 1.0) {
+        minW = (widget.minimumImageSize * ar / fitted.width).clamp(0.0, 1.0);
+      } else if (ar > 1.0) {
+        minH = (widget.minimumImageSize / (ar * fitted.height)).clamp(0.0, 1.0);
+      }
+    }
     final maxW = widget.maximumImageSize.isFinite ? (widget.maximumImageSize / fitted.width).clamp(minW, 1.0) : 1.0;
     final maxH = widget.maximumImageSize.isFinite ? (widget.maximumImageSize / fitted.height).clamp(minH, 1.0) : 1.0;
 
@@ -942,10 +950,8 @@ class _PanZoomDimmedSurroundPainter extends CustomPainter {
     canvas.translate(ox, oy);
     canvas.translate(-pixelCrop.left * s, -pixelCrop.top * s);
     canvas.scale(s);
-    _paint.filterQuality = FilterQuality.high;
     _paint.color = Color.fromRGBO(255, 255, 255, opacity);
     _paint.blendMode = BlendMode.darken;
-    _paint.isAntiAlias = true;
     _paintRotatedImageIntoRect(canvas, image, rotation, fittedSize, _paint);
     canvas.restore();
     canvas.restore();
