@@ -864,9 +864,9 @@ void _paintRotatedImageIntoRect(
   Rect localVisibleRect = visibleRect;
   if (rotation != CropRotation.up) {
     final Matrix4 matrix = Matrix4.identity()
-      ..translate(targetWidth / 2, targetHeight / 2)
+      ..multiply(Matrix4.translationValues(targetWidth / 2, targetHeight / 2, 0))
       ..rotateZ(rotation.radians)
-      ..translate(-targetWidth / 2, -targetHeight / 2);
+      ..multiply(Matrix4.translationValues(-targetWidth / 2, -targetHeight / 2, 0));
     final Matrix4 inverse = matrix.clone()..invert();
     localVisibleRect = MatrixUtils.transformRect(inverse, visibleRect);
   }
